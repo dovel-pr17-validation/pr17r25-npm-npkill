@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "sourceMap": true,
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "node",
+    "declaration": true,
+    "rootDir": "./src/",
+    "outDir": "./lib/",
+    "strict": true,
+    "strictFunctionTypes": true,
+    "noImplicitAny": false,
+    "noImplicitOverride": true,
+    "strictNullChecks": true,
+    "strictPropertyInitialization": false,
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "skipLibCheck": true,
+    "paths": {
+      "@core/*": ["src/core/*"]
+    },
+    "ignoreDeprecations": "6.0",
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "__tests__"]
+}

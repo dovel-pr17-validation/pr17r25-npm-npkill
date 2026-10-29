@@ -1,0 +1,72 @@
+import ansiEscapes from 'ansi-escapes';
+import { Position, BaseUi } from '../ui/index.js';
+
+export class UiService {
+  stdin: NodeJS.ReadStream = process.stdin;
+  // public stdout: NodeJS.WriteStream = process.stdout;
+  uiComponents: BaseUi[] = [];
+
+  setRawMode(set = true): void {
+    if (this.stdin.isTTY) {
+      this.stdin.setRawMode(set);
+    }
+    process.stdin.resume();
+  }
+
+  setCursorVisible(visible: boolean): void {
+    const instruction = visible
+      ? ansiEscapes.cursorShow
+      : ansiEscapes.cursorHide;
+    this.print(instruction);
+  }
+
+  add(component: BaseUi): void {
+    this.uiComponents.push(component);
+  }
+
+  remove(baseUiId: string): void {
+    this.uiComponents = this.uiComponents.filter((c) => c.id !== baseUiId);
+  }
+
+  renderAll(): void {
+    this.clear();
+    this.uiComponents.forEach((component) => {
+      if (component.visible) {
+        component.render();
+      }
+    });
+  }
+
+  setFreezeAll(freeze: boolean): void {
+    this.uiComponents.forEach((component) => {
+      component.freezed = freeze;
+    });
+  }
+
+  setVisibleAll(visible: boolean): void {
+    this.uiComponents.forEach((component) => {
+      component.setVisible(visible);
+    });
+  }
+
+  clear(): void {
+    this.print(ansiEscapes.clearTerminal);
+  }
+
+  print(text: string): void {
+    process.stdout.write.bind(process.stdout)(text);
+  }
+
+  printAt(message: string, position: Position): void {
+    this.setCursorAt(position);
+    this.print(message);
+  }
+
+  setCursorAt({ x, y }: Position): void {
+    this.print(ansiEscapes.cursorTo(x, y));
+  }
+
+  clearLine(row: number): void {
+    this.printAt(ansiEscapes.eraseLine, { x: 0, y: row });
+  }
+}

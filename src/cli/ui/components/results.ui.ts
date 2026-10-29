@@ -1,0 +1,829 @@
+import {
+  DECIMALS_SIZE,
+  DEFAULT_CONFIG,
+  MARGINS,
+  OVERFLOW_CUT_FROM,
+} from '../../../constants/main.constants.js';
+
+import { InteractiveUi } from '../base.ui.js';
+import { HeavyUi } from '../heavy.ui.js';
+
+import { ConsoleService } from '../../services/console.service.js';
+import { IConfig } from '../../interfaces/config.interface.js';
+import { IKeyPress } from '../../interfaces/key-press.interface.js';
+import { INFO_MSGS } from '../../../constants/messages.constants.js';
+import { ResultsService } from '../../services/results.service.js';
+import { Subject } from 'rxjs';
+import pc from 'picocolors';
+import { resolve } from 'node:path';
+import { CliScanFoundFolder } from '../../../cli/interfaces/stats.interface.js';
+import { formatSize } from '../../../utils/unit-conversions.js';
+import {
+  ResultColumnId,
+  ResultColumnLayout,
+  getColumnLayout,
+  getResultColumns,
+} from './result-columns.js';
+
+const CURSOR_ROW_COLOR = 'bgBlue';
+
+export class ResultsUi extends HeavyUi implements InteractiveUi {
+  resultIndex = 0;
+  previousIndex = 0;
+  scroll: number = 0;
+  private haveResultsAfterCompleted = true;
+  private selectMode = false;
+  private selectedFolders: Map<string, CliScanFoundFolder> = new Map();
+  private rangeSelectionStart: number | null = null;
+  private isRangeSelectionMode: boolean = false;
+
+  readonly delete$ = new Subject<CliScanFoundFolder>();
+  readonly deleteMultiple$ = new Subject<CliScanFoundFolder[]>();
+  readonly showErrors$ = new Subject<null>();
+  readonly openFolder$ = new Subject<string>();
+  readonly showDetails$ = new Subject<CliScanFoundFolder>();
+  readonly goOptions$ = new Subject<null>();
+  readonly endNpkill$ = new Subject<null>();
+  readonly search$ = new Subject<{
+    text: string;
+    isInputActive: boolean;
+  } | null>();
+
+  private isSearchInputMode = false;
+  private searchText = '';
+  private filteredResults: CliScanFoundFolder[] = [];
+
+  private config: IConfig = DEFAULT_CONFIG;
+  private readonly KEYS = {
+    up: () => this.cursorUp(),
+    down: () => this.cursorDown(),
+    space: () => this.handleSpacePress(),
+    delete: () => this.handleSpacePress(),
+    j: () => this.cursorDown(),
+    k: () => this.cursorUp(),
+    h: () => this.goOptions(),
+    l: () => this.showDetails(),
+    d: () => this.cursorPageDown(),
+    u: () => this.cursorPageUp(),
+    pageup: () => this.cursorPageUp(),
+    pagedown: () => this.cursorPageDown(),
+    home: () => this.cursorFirstResult(),
+    end: () => this.cursorLastResult(),
+    e: () => this.showErrorsPopup(),
+    o: () => this.openFolder(),
+    right: () => this.showDetails(),
+    left: () => this.goOptions(),
+    q: () => this.endNpkill(),
+    t: () => this.toggleSelectMode(),
+    return: () => this.deleteSelected(),
+    enter: () => this.deleteSelected(),
+    v: () => this.startRangeSelection(),
+    a: () => this.toggleSelectAll(),
+  };
+
+  constructor(
+    private readonly resultsService: ResultsService,
+    private readonly consoleService: ConsoleService,
+    config?: IConfig,
+  ) {
+    super();
+    if (config) {
+      this.config = config;
+    }
+  }
+
+  private openFolder(): void {
+    const folder = this.results[this.resultIndex];
+    const parentPath = resolve(folder.path, '..');
+    this.openFolder$.next(parentPath);
+  }
+
+  private showDetails(): void {
+    const result = this.results[this.resultIndex];
+    if (!result) {
+      return;
+    }
+    this.showDetails$.next(result);
+  }
+
+  private goOptions(): void {
+    if (this.searchText) {
+      return;
+    }
+    this.goOptions$.next(null);
+  }
+
+  private endNpkill(): void {
+    this.endNpkill$.next(null);
+  }
+
+  private toggleSelectMode(): void {
+    this.selectMode = !this.selectMode;
+    if (!this.selectMode) {
+      this.selectedFolders.clear();
+      this.rangeSelectionStart = null;
+      this.isRangeSelectionMode = false;
+    }
+  }
+
+  private startRangeSelection(): void {
+    if (!this.selectMode) {
+      return;
+    }
+
+    if (this.isRangeSelectionMode) {
+      // Selection mode was started, so end the range.
+      this.isRangeSelectionMode = false;
+      this.rangeSelectionStart = null;
+      return;
+    }
+
+    this.isRangeSelectionMode = true;
+    this.rangeSelectionStart = this.resultIndex;
+
+    const folder = this.results[this.resultIndex];
+    if (folder) {
+      if (this.selectedFolders.has(folder.path)) {
+        this.selectedFolders.delete(folder.path);
+      } else {
+        this.selectedFolders.set(folder.path, folder);
+      }
+    }
+  }
+
+  private toggleSelectAll(): void {
+    if (!this.selectMode) {
+      return;
+    }
+
+    const allFolders = this.results;
+    const totalFolders = allFolders.length;
+    const selectedCount = this.selectedFolders.size;
+
+    // If all folders are selected, deselect all
+    // If some or none are selected, select all
+    if (selectedCount === totalFolders) {
+      this.selectedFolders.clear();
+    } else {
+      allFolders.forEach((folder) => {
+        this.selectedFolders.set(folder.path, folder);
+      });
+    }
+  }
+
+  private handleSpacePress(): void {
+    if (!this.selectMode) {
+      this.delete();
+      return;
+    }
+
+    this.toggleFolderSelection();
+  }
+
+  private toggleFolderSelection(): void {
+    const folder = this.results[this.resultIndex];
+    if (!folder) {
+      return;
+    }
+
+    if (this.selectedFolders.has(folder.path)) {
+      this.selectedFolders.delete(folder.path);
+    } else {
+      this.selectedFolders.set(folder.path, folder);
+    }
+  }
+
+  private applyRangeSelection(): void {
+    if (
+      !this.selectMode ||
+      !this.isRangeSelectionMode ||
+      this.rangeSelectionStart === null
+    ) {
+      return;
+    }
+
+    const start = Math.min(this.rangeSelectionStart, this.resultIndex);
+    const end = Math.max(this.rangeSelectionStart, this.resultIndex);
+
+    const firstFolder = this.results[this.rangeSelectionStart];
+    if (!firstFolder) {
+      return;
+    }
+
+    const shouldSelect = this.selectedFolders.has(firstFolder.path);
+
+    for (let i = start; i <= end; i++) {
+      const folder = this.results[i];
+      if (!folder) {
+        continue;
+      }
+
+      if (shouldSelect) {
+        this.selectedFolders.set(folder.path, folder);
+      } else {
+        this.selectedFolders.delete(folder.path);
+      }
+    }
+  }
+
+  private deleteSelected(): void {
+    if (!this.selectMode || this.selectedFolders.size === 0) {
+      return;
+    }
+
+    const selectedFolders = this.selectedFolders.entries();
+    for (const [, folder] of selectedFolders) {
+      this.delete$.next(folder);
+    }
+    this.selectedFolders.clear();
+  }
+
+  private activateSearchInputMode(): void {
+    this.isSearchInputMode = true;
+    this.search$.next({ text: this.searchText, isInputActive: true });
+    this.render();
+  }
+
+  private handleSearchInput(key: IKeyPress): void {
+    if (key.name === 'return' || key.name === 'enter') {
+      this.isSearchInputMode = false;
+      if (this.searchText.trim() === '') {
+        this.searchText = '';
+        this.search$.next(null);
+      } else {
+        this.search$.next({ text: this.searchText, isInputActive: false });
+      }
+      this.render();
+      return;
+    }
+
+    if (key.name === 'backspace') {
+      this.searchText = this.searchText.slice(0, -1);
+    } else if (key.name === 'escape') {
+      this.isSearchInputMode = false;
+      this.searchText = '';
+      this.search$.next(null);
+      this.render();
+      return;
+    } else if (
+      key.sequence &&
+      key.sequence.length === 1 &&
+      !key.ctrl &&
+      !key.meta
+    ) {
+      this.searchText += key.sequence;
+    } else {
+      return;
+    }
+
+    this.filterResults();
+    this.search$.next({ text: this.searchText, isInputActive: true });
+    this.resultIndex = 0;
+    this.scroll = 0;
+    this.render();
+  }
+
+  private filterResults(): void {
+    try {
+      const regex = new RegExp(this.searchText, 'i');
+      this.filteredResults = this.resultsService.results.filter((r) =>
+        regex.test(r.path),
+      );
+    } catch {
+      this.filteredResults = [];
+    }
+  }
+
+  onKeyInput(key: IKeyPress): void {
+    if (this.isSearchInputMode) {
+      this.handleSearchInput(key);
+      return;
+    }
+
+    if (key.sequence === '/') {
+      this.activateSearchInputMode();
+      return;
+    }
+
+    const action: (() => void) | undefined = this.KEYS[key.name];
+    if (action === undefined) {
+      return;
+    }
+    action();
+
+    if (this.visible) {
+      this.render();
+    }
+  }
+
+  render(): void {
+    if (!this.visible) {
+      return;
+    }
+
+    this.clear();
+
+    if (!this.haveResultsAfterCompleted) {
+      this.noResults();
+      return;
+    }
+
+    this.printResults();
+
+    const tagStartXPosition = 16;
+    // 14 for the selection counter, 56 for the instruction message
+    const maxClearLength = 14 + 56;
+    const availableWidthForClear = this.terminal.columns - tagStartXPosition;
+    const clearLength = Math.min(maxClearLength, availableWidthForClear);
+    const clearSelectionCounterText = ' '.repeat(Math.max(0, clearLength));
+
+    this.printAt(clearSelectionCounterText, {
+      x: tagStartXPosition,
+      y: MARGINS.ROW_RESULTS_START - 2,
+    });
+    if (this.selectMode) {
+      const selectedMessage = ` ${this.selectedFolders.size} selected `;
+      this.printAt(pc.bgYellow(pc.black(selectedMessage)), {
+        x: tagStartXPosition,
+        y: MARGINS.ROW_RESULTS_START - 2,
+      });
+
+      const instructionMessage = pc.gray(
+        pc.bold('SPACE') +
+          ': toggle | ' +
+          pc.bold('v') +
+          ': range | ' +
+          pc.bold('a') +
+          ': select all | ' +
+          pc.bold('ENTER') +
+          ': delete',
+      );
+
+      const startX = tagStartXPosition + selectedMessage.length + 1;
+      const availableWidth = this.terminal.columns - startX;
+      const truncatedInstructionMessage = this.truncateText(
+        instructionMessage,
+        availableWidth,
+      );
+
+      this.printAt(truncatedInstructionMessage, {
+        x: startX,
+        y: MARGINS.ROW_RESULTS_START - 2,
+      });
+    }
+
+    this.printScrollBar();
+    this.flush();
+  }
+
+  clear(): void {
+    this.resetBufferState();
+    for (let row = MARGINS.ROW_RESULTS_START; row < this.terminal.rows; row++) {
+      this.clearLine(row);
+    }
+  }
+
+  completeSearch(): void {
+    if (this.resultsService.results.length === 0) {
+      this.haveResultsAfterCompleted = false;
+      this.render();
+    }
+  }
+
+  private printResults(): void {
+    const visibleFolders = this.getVisibleScrollFolders();
+    const layout = this.computeColumnLayout();
+
+    visibleFolders.forEach((folder: CliScanFoundFolder, index: number) => {
+      const row = MARGINS.ROW_RESULTS_START + index;
+      this.printFolderRow(folder, row, layout);
+    });
+  }
+
+  private computeColumnLayout(): ResultColumnLayout {
+    return getColumnLayout(
+      getResultColumns(this.config),
+      this.terminal.columns,
+    );
+  }
+
+  private noResults(): void {
+    const targetFolderColored: string = pc.yellowBright(
+      this.config.targets.join(', '),
+    );
+    const message = `No ${targetFolderColored} found!`;
+    this.printAt(message, {
+      x: Math.floor(this.terminal.columns / 2 - message.length / 2),
+      y: MARGINS.ROW_RESULTS_START + 2,
+    });
+  }
+
+  private printFolderRow(
+    folder: CliScanFoundFolder,
+    row: number,
+    layout: ResultColumnLayout,
+  ): void {
+    this.clearLine(row);
+    let path = this.getFolderPathText(folder, layout);
+    const isRowSelected =
+      row === this.getRealCursorPosY() && !this.isSearchInputMode;
+
+    // Adjust column start based on select mode
+    const pathColumnStart = this.selectMode
+      ? MARGINS.FOLDER_COLUMN_START + 1
+      : MARGINS.FOLDER_COLUMN_START;
+
+    if (isRowSelected) {
+      path = pc[CURSOR_ROW_COLOR](path);
+      this.paintBgRow(row, layout);
+    }
+
+    if (folder.riskAnalysis?.isSensitive) {
+      path += '⚠️';
+    }
+
+    const isFolderSelected = this.selectedFolders.has(folder.path);
+    if (folder.riskAnalysis?.isSensitive) {
+      path = pc[isFolderSelected ? 'blue' : 'yellowBright'](path);
+    } else if (!isRowSelected && isFolderSelected) {
+      path = pc.blue(path);
+    }
+
+    if (this.selectMode && this.selectedFolders.has(folder.path)) {
+      this.rangeSelectedCursor(row);
+    }
+
+    if (this.selectMode && this.isRangeSelectionMode && isRowSelected) {
+      this.selectionCursor(row);
+    }
+
+    this.printAt(path, {
+      x: pathColumnStart,
+      y: row,
+    });
+
+    for (const { column, x } of layout.positions) {
+      let cellText = this.getCellText(column.id, folder, isRowSelected);
+      if (isRowSelected) {
+        cellText = pc[CURSOR_ROW_COLOR](cellText);
+      }
+      this.printAt(cellText, { x, y: row });
+    }
+  }
+
+  private getCellText(
+    columnId: ResultColumnId,
+    folder: CliScanFoundFolder,
+    isRowSelected: boolean,
+  ): string {
+    switch (columnId) {
+      case 'age':
+        return this.getAgeCellText(folder, isRowSelected);
+      case 'size':
+        return this.getSizeCellText(folder);
+    }
+  }
+
+  private getAgeCellText(
+    folder: CliScanFoundFolder,
+    isRowSelected: boolean,
+  ): string {
+    const WIDTH = 4;
+    let text: string;
+
+    if (folder.riskAnalysis?.isSensitive) {
+      text = '';
+    } else if (
+      folder.modificationTime !== null &&
+      folder.modificationTime > 0
+    ) {
+      const days = Math.floor(
+        (new Date().getTime() / 1000 - folder.modificationTime) / 86400,
+      );
+      text = `${Math.min(days, 999)}d`;
+    } else {
+      text = '...';
+    }
+
+    const padded = text.padStart(WIDTH).slice(0, WIDTH);
+    return isRowSelected ? pc.white(padded) : pc.gray(padded);
+  }
+
+  private getSizeCellText(folder: CliScanFoundFolder): string {
+    const WIDTH = 9;
+    const alignSizeText = (text: string) =>
+      text
+        .padStart(WIDTH - 1)
+        .padEnd(WIDTH)
+        .slice(0, WIDTH);
+    const isCalculating = folder.size === 0 && folder.modificationTime === -1;
+    if (isCalculating) {
+      return pc.gray(alignSizeText('.....'));
+    }
+
+    const formattedSize = formatSize(
+      folder.size,
+      this.config.sizeUnit,
+      DECIMALS_SIZE,
+    );
+
+    return alignSizeText(formattedSize.text);
+  }
+
+  private rangeSelectedCursor(row: number): void {
+    this.printAt('●', {
+      x: MARGINS.FOLDER_COLUMN_START,
+      y: row,
+    });
+  }
+
+  private selectionCursor(row: number): void {
+    const indicator = this.isRangeSelectionMode ? '●' : ' ';
+    this.printAt(pc.yellow(indicator), {
+      x: MARGINS.FOLDER_COLUMN_START - 1,
+      y: row,
+    });
+  }
+
+  cursorUp(): void {
+    this.moveCursor(-1);
+  }
+
+  cursorDown(): void {
+    this.moveCursor(1);
+  }
+
+  cursorPageUp(): void {
+    const resultsInPage = this.getRowsAvailable();
+    this.moveCursor(-(resultsInPage - 2));
+  }
+
+  cursorPageDown(): void {
+    const resultsInPage = this.getRowsAvailable();
+    this.moveCursor(resultsInPage - 2);
+  }
+
+  cursorFirstResult(): void {
+    this.moveCursor(-this.resultIndex);
+  }
+
+  cursorLastResult(): void {
+    this.moveCursor(this.results.length - 1);
+  }
+
+  fitScroll(): void {
+    const shouldScrollUp =
+      this.getRow(this.resultIndex) <
+      MARGINS.ROW_RESULTS_START + this.scroll + 1;
+
+    const shouldScrollDown =
+      this.getRow(this.resultIndex) > this.terminal.rows + this.scroll - 2;
+
+    const isOnBotton = this.resultIndex === this.results.length - 1;
+
+    let scrollRequired = 0;
+
+    if (shouldScrollUp) {
+      scrollRequired =
+        this.getRow(this.resultIndex) -
+        MARGINS.ROW_RESULTS_START -
+        this.scroll -
+        1;
+    } else if (shouldScrollDown) {
+      scrollRequired =
+        this.getRow(this.resultIndex) - this.terminal.rows - this.scroll + 2;
+
+      if (isOnBotton) {
+        scrollRequired -= 1;
+      }
+    }
+
+    if (scrollRequired !== 0) {
+      this.scrollFolderResults(scrollRequired);
+    }
+  }
+
+  scrollFolderResults(scrollAmount: number): void {
+    const virtualFinalScroll = this.scroll + scrollAmount;
+    this.scroll = this.clamp(virtualFinalScroll, 0, this.results.length);
+    this.clear();
+  }
+
+  private moveCursor(index: number): void {
+    this.previousIndex = this.resultIndex;
+    this.resultIndex += index;
+
+    // Upper limit
+    if (this.isCursorInLowerLimit()) {
+      this.resultIndex = 0;
+    }
+
+    // Lower limit
+    if (this.isCursorInUpperLimit()) {
+      this.resultIndex = this.results.length - 1;
+    }
+
+    this.fitScroll();
+
+    if (this.isRangeSelectionMode) {
+      this.applyRangeSelection();
+    }
+  }
+
+  private getFolderPathText(
+    folder: CliScanFoundFolder,
+    layout: ResultColumnLayout,
+  ): string {
+    let cutFrom = OVERFLOW_CUT_FROM;
+    let text = folder.path;
+    const ACTIONS = {
+      deleted: () => {
+        cutFrom += INFO_MSGS.DELETED_FOLDER.length;
+        text = INFO_MSGS.DELETED_FOLDER + text;
+      },
+      deleting: () => {
+        cutFrom += INFO_MSGS.DELETING_FOLDER.length;
+        text = INFO_MSGS.DELETING_FOLDER + text;
+      },
+      'error-deleting': () => {
+        cutFrom += INFO_MSGS.ERROR_DELETING_FOLDER.length;
+        text = INFO_MSGS.ERROR_DELETING_FOLDER + text;
+      },
+    };
+
+    if (ACTIONS[folder.status] !== undefined) {
+      ACTIONS[folder.status]();
+    }
+
+    const columnEnd = this.selectMode
+      ? layout.pathReservedWidth + 1
+      : layout.pathReservedWidth;
+
+    text = this.consoleService.shortenText(
+      text,
+      this.terminal.columns - columnEnd,
+      cutFrom,
+    );
+
+    // This is necessary for the coloring of the text, since
+    // the shortener takes into ansi-scape codes invisible
+    // characters and can cause an error in the cli.
+    text = this.paintStatusFolderPath(text, folder.status);
+
+    return text;
+  }
+
+  private paintStatusFolderPath(folderString: string, action: string): string {
+    const TRANSFORMATIONS = {
+      deleted: (text) =>
+        text.replace(
+          INFO_MSGS.DELETED_FOLDER,
+          pc.green(INFO_MSGS.DELETED_FOLDER),
+        ),
+      deleting: (text) =>
+        text.replace(
+          INFO_MSGS.DELETING_FOLDER,
+          pc.yellow(INFO_MSGS.DELETING_FOLDER),
+        ),
+      'error-deleting': (text) =>
+        text.replace(
+          INFO_MSGS.ERROR_DELETING_FOLDER,
+          pc.red(INFO_MSGS.ERROR_DELETING_FOLDER),
+        ),
+    };
+
+    return TRANSFORMATIONS[action] !== undefined
+      ? TRANSFORMATIONS[action](folderString)
+      : folderString;
+  }
+
+  private printScrollBar(): void {
+    const SCROLLBAR_ACTIVE = pc.gray('█');
+    const SCROLLBAR_BG = pc.gray('┊');
+
+    const totalResults = this.results.length;
+    const visibleRows = this.getRowsAvailable();
+
+    if (totalResults <= visibleRows) {
+      return;
+    }
+
+    const scrollPercentage = this.scroll / (totalResults - visibleRows);
+    const start = MARGINS.ROW_RESULTS_START;
+    const end = this.terminal.rows - 1;
+    const scrollBarPosition = Math.round(
+      scrollPercentage * (end - start) + start,
+    );
+
+    for (let i = start; i <= end; i++) {
+      this.printAt(SCROLLBAR_BG, {
+        x: this.terminal.columns - 1,
+        y: i,
+      });
+    }
+
+    this.printAt(SCROLLBAR_ACTIVE, {
+      x: this.terminal.columns - 1,
+      y: scrollBarPosition,
+    });
+  }
+
+  private isCursorInLowerLimit(): boolean {
+    return this.resultIndex < 0;
+  }
+
+  private isCursorInUpperLimit(): boolean {
+    return this.resultIndex >= this.results.length;
+  }
+
+  private getRealCursorPosY(): number {
+    return this.getRow(this.resultIndex) - this.scroll;
+  }
+
+  private getVisibleScrollFolders(): CliScanFoundFolder[] {
+    return this.results.slice(
+      this.scroll,
+      this.getRowsAvailable() + this.scroll,
+    );
+  }
+
+  private paintBgRow(row: number, layout: ResultColumnLayout): void {
+    const startPaint = MARGINS.FOLDER_COLUMN_START;
+    const endPaint =
+      layout.positions.length > 0
+        ? layout.firstColumnX
+        : this.terminal.columns - 1;
+    let paintSpaces = '';
+
+    for (let i = startPaint; i < endPaint; ++i) {
+      paintSpaces += ' ';
+    }
+
+    this.printAt(pc[CURSOR_ROW_COLOR](paintSpaces), {
+      x: startPaint,
+      y: row,
+    });
+  }
+
+  private delete(): void {
+    const folder = this.results[this.resultIndex];
+    this.delete$.next(folder);
+  }
+
+  /** Returns the number of results that can be displayed. */
+  private getRowsAvailable(): number {
+    return this.terminal.rows - MARGINS.ROW_RESULTS_START;
+  }
+
+  /** Returns the row to which the index corresponds. */
+  private getRow(index: number): number {
+    return index + MARGINS.ROW_RESULTS_START;
+  }
+
+  private showErrorsPopup(): void {
+    this.showErrors$.next(null);
+  }
+
+  private truncateText(text: string, maxLength: number): string {
+    const stripAnsi = (str: string) => str.replace(/\x1b\[[0-9;]*m/g, '');
+    const plainText = stripAnsi(text);
+
+    if (plainText.length <= maxLength) {
+      return text;
+    }
+
+    const targetLength = maxLength - 3;
+    if (targetLength <= 0) {
+      return '...';
+    }
+
+    let visibleLength = 0;
+    let output = '';
+    let i = 0;
+    const ansiRegex = /\x1b\[[0-9;]*m/;
+
+    while (i < text.length && visibleLength < targetLength) {
+      const remaining = text.substring(i);
+      const match = remaining.match(ansiRegex);
+
+      if (match && match.index === 0) {
+        output += match[0];
+        i += match[0].length;
+      } else {
+        output += text[i];
+        visibleLength++;
+        i++;
+      }
+    }
+
+    return output + '...' + '\x1b[0m';
+  }
+
+  private clamp(num: number, min: number, max: number): number {
+    return Math.min(Math.max(num, min), max);
+  }
+
+  private get results(): CliScanFoundFolder[] {
+    return this.searchText ? this.filteredResults : this.resultsService.results;
+  }
+}
